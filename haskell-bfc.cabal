@@ -1,0 +1,13 @@
+Name:                haskell-bfc
+Version:             0.1
+Author:              Josiah Worcester
+Maintainer:          josiahw@gmail.com
+
+Cabal-version:       >=1.2
+
+Build-type:	     Simple
+
+Executable haskell-bfc
+  Main-is: 	     main.hs
+  Build-depends:     base, mtl, deepseq
+
