@@ -9,5 +9,4 @@ Build-type:	     Simple
 
 Executable haskell-bfc
   Main-is: 	     main.hs
-  Build-depends:     base, mtl, deepseq
-
+  Build-depends:     base >= 4, mtl

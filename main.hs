@@ -1,25 +1,17 @@
-import Control.DeepSeq
 import Control.Monad.State
 
-data BF = Add Int Int
-        | Move Int
+data BF = Add !Int !Int
+        | Move !Int
         | In
         | Out
-        | Loop Int [BF]
-        | Set Int Int
+        | Loop !Int [BF]
+        | Set !Int !Int
           deriving (Show, Eq)
 
 data Syscalls = Read
               | Write
               | Indeterm
                 deriving Eq
-
-instance NFData BF where
-    rnf (Add a b) = a `seq` b `seq` ()
-    rnf (Move a) = a `seq` ()
-    rnf (Loop a b) = a `seq` b `deepseq` ()
-    rnf (Set a b) = a `seq` b `seq` ()
-    rnf x = x `seq` ()
 
 ----
 -- Parser
@@ -46,25 +38,19 @@ parse =
 ----
 -- Optimisation
 ----
-
 opt :: [BF] -> [BF]
-opt = omitInit . fixPointOfOpts
-    where omitInit (Loop _ _ : xs) = omitInit xs
-          omitInit (Set _ 0 : xs) = omitInit xs
-          omitInit x = x
+opt = dropWhile f . allPasses . offset 0 0
+    where f (Loop _ _) = True
+          f (Set _ 0) = True
+          f _ = False
 
--- Finds the fixed point of the optimisation functions; runs the optimisations
--- until nothing changes.
--- This is strict because laziness involves somewhat excessive memory usage.
-fixPointOfOpts :: [BF] -> [BF]
-fixPointOfOpts x = if allPasses x == x then x else fixPointOfOpts $!! allPasses x
-    where f $!! x = x `deepseq` f x
+allPasses :: [BF] -> [BF]
+allPasses = intoLoops . dce . sets . rle
 
-allPasses = intoLoops . offset . dce . sets . rle
-
-intoLoops (Loop a x : xs) = Loop a (allPasses x) : intoLoops xs
-intoLoops (x : xs) = x : intoLoops xs
-intoLoops [] = []
+intoLoops :: [BF] -> [BF]
+intoLoops = map f
+            where f (Loop a x) = Loop a (allPasses x)
+                  f x = x
 
 -- Run-length encode addition and movement operations
 rle :: [BF] -> [BF]
@@ -93,30 +79,43 @@ dce :: [BF] -> [BF]
 dce (Loop a x : Loop b y : xs) 
     | a == b = dce $ Loop a x : xs
     | otherwise = Loop a x : (dce $ Loop b y : xs)
-dce (Add a x : Set b y : xs)
-    | a == b = dce $ Set b y : xs
-    | otherwise = Add a x : (dce $ Set b y : xs)
+dce (Loop a x : Set b y : xs)
+    | a == b && y == 0 = dce $ Loop a x : xs
+    | otherwise = Loop a x : (dce $ Set b y : xs)
+dce (Set a x : Loop b y : xs)
+    | a == b && x == 0 = dce $ Set a x : xs
+    | otherwise = Set a x : (dce $ Loop b y : xs)
 dce (Set a x : Set b y : xs)
     | a == b = dce $ Set b y : xs
     | otherwise = Set a x : (dce $ Set b y : xs)
-dce (Add _ 0 : xs) = dce xs
-dce (Move 0 : xs) = dce xs
+dce (Add a x : Set b y : xs)
+    | a == b = dce $ Set b y : xs
+    | otherwise = Add a x : (dce $ Set b y : xs)
+dce (Add _ 0 : xs) = xs
+dce (Move 0 : xs) = xs
 dce (x : xs) = x : dce xs
 dce [] = []
 
 -- Attempt to reduce the amount of pointer movements done
-offset :: [BF] -> [BF]
-offset (Move x : Add a y : xs) = Add (a+x) y : (offset $ Move x : xs)
-offset (Move x : Set a y : xs) = Set (a+x) y : (offset $ Move x : xs)
-offset (Move x : Loop a y : xs) = Loop (a+x) (Move x : y ++ [Move (x*(-1))]) : (offset $ Move x : xs)
-offset (x : xs) = x : offset xs
-offset [] = []
+offset :: Int -> Int -> [BF] -> [BF]
+offset m n (Loop a y : xs) = Loop (a+m) (offset m (-m) y) : offset m n xs
+offset m n (Move x : xs) = offset (m+x) n xs
+offset m n (Add a x : xs) = Add (a+m) x : offset m n xs
+offset m n (Set a x : xs) = Set (a+m) x : offset m n xs
+offset 0 n (x : xs) = x : offset 0 n xs
+offset m n (x : xs) = Move m : x : offset 0 n xs
+offset m n []
+  | m /= (-n) = [Move (m+n)]
+  | otherwise = []
 
 ----
 -- Compilation
 ----
-comp :: [BF] -> String
-comp xs = prelude ++ codeGen xs ++ postlude
+comp :: [BF] -> IO ()
+comp x = do
+  putStr prelude
+  sequence_ . codeGen $ x
+  putStr postlude
 
 prelude = "BITS 32\n" ++ 
           "SECTION .text\n" ++
@@ -134,59 +133,52 @@ postlude = "\tmov eax, 1\n" ++
            "SECTION .bss\n" ++
            "data\tresb 30000\n"
 
-codeGen :: [BF] -> String
-codeGen xs = evalState (codeGen' xs) (0, Indeterm)
-    where codeGen' :: [BF] -> State (Int, Syscalls) String
-          codeGen' (In:xs) = do (label, sys) <- get
-                                put (label+1, Read)
-                                next <- codeGen' xs
-                                let setebx = case sys of Read -> ""
-                                                         Write -> "\tdec bl\n"
-                                                         Indeterm -> "\txor ebx,ebx\n"
-                                return $ "\tmov eax, esp\n" ++
-                                         setebx ++
-                                         "\tint 80h\n" ++
-                                         "\tcmp eax, 1\n" ++
-                                         "\tje L" ++ (show label) ++ "\n" ++
-                                         "\tmov byte [ecx], 0\n" ++
-                                         "L" ++ (show label) ++ ":\n" ++ next
-          codeGen' (Out:xs) = do sys <- getSyscall
-                                 putSyscall Write
-                                 next <- codeGen' xs
-                                 let setebx = case sys of Read -> "\tinc bl\n"
-                                                          Write -> ""
-                                                          Indeterm -> "\tmov ebx,edx\n"
-                                 return $ "\tmov eax, ebp\n" ++
-                                          setebx ++
-                                          "\tint 80h\n" ++ next
-          codeGen' (Add a x:xs) = do next <- codeGen' xs
-                                     let offby = if a == 0 then "" else " + " ++ (show a)
-                                     return $ (case x of 1  -> "\tinc byte [ecx" ++ offby ++ "]"
-                                                         -1 -> "\tdec byte [ecx" ++ offby ++ "]"
-                                                         _  -> "\tadd byte [ecx" ++ offby ++ "], " ++ (show x)) ++ "\n" ++ next
-          codeGen' (Move x:xs) = do next <- codeGen' xs
-                                    return $ (case x of 1  -> "\tinc ecx"
-                                                        -1 -> "\tdec ecx"
-                                                        _  -> "\tadd ecx, " ++ (show x)) ++ "\n" ++ next
-          codeGen' (Loop a x:xs) = do label <- getLabel
-                                      put (label+2, Indeterm)
-                                      loopContents <- codeGen' x
-                                      putSyscall Indeterm
-                                      next <- codeGen' xs
-                                      let offby = if a == 0 then "" else " + " ++ (show a)
-                                          bLabel = "L" ++ show label
-                                          eLabel = "L" ++ show (label+1)
-                                      return $ "\tcmp byte [ecx" ++ offby ++ "], 0\n" ++
-                                               "\tje " ++ bLabel ++ "\n" ++
-                                               eLabel ++ ":\n" ++
-                                               loopContents ++
-                                               "\tcmp byte [ecx" ++ offby ++ "], 0\n" ++
-                                               "\tjne " ++ eLabel ++ "\n" ++
-                                               bLabel ++ ":\n" ++ next
-          codeGen' (Set a x:xs) = do next <- codeGen' xs
-                                     let offby = if a == 0 then "" else " + " ++ (show a)
-                                     return $ "\tmov byte [ecx" ++ offby ++ "], " ++ (show x) ++ "\n" ++ next
-          codeGen' [] = return []
+codeGen :: [BF] -> [IO ()]
+codeGen xs = evalState (mapM codeGen' xs) (0, Indeterm)
+    where codeGen' :: BF -> State (Int, Syscalls) (IO ())
+          codeGen' In = do (label, sys) <- get
+                           put (label+1, Read)
+                           let setebx = case sys of Read -> ""
+                                                    Write -> "\tdec bl\n"
+                                                    Indeterm -> "\txor ebx,ebx\n"
+                           return $ do putStrLn "\tmov eax, esp"
+                                       putStr setebx
+                                       putStr $ "\tint 80h\n" ++
+                                                "\tcmp eax, 1\n" ++
+                                                "\tje L" ++ (show label) ++ "\n" ++
+                                                "\tmov byte [ecx], 0\n" ++
+                                                "L" ++ (show label) ++ ":\n"
+          codeGen' Out = do sys <- getSyscall
+                            putSyscall Write
+                            let setebx = case sys of Read -> "\tinc bl\n"
+                                                     Write -> ""
+                                                     Indeterm -> "\tmov ebx,edx\n"
+                            return . putStrLn $ "\tmov eax, ebp\n" ++
+                                                setebx ++
+                                                "\tint 80h"
+          codeGen' (Add a x) = return . putStrLn $ case x of 1  -> "\tinc byte [ecx" ++ offby ++ "]"
+                                                             -1 -> "\tdec byte [ecx" ++ offby ++ "]"
+                                                             _  -> "\tadd byte [ecx" ++ offby ++ "], " ++ (show x)
+            where offby = if a == 0 then "" else " + " ++ (show a)
+          codeGen' (Move x) = return . putStrLn $ case x of 1  -> "\tinc ecx"
+                                                            -1 -> "\tdec ecx"
+                                                            _  -> "\tadd ecx, " ++ (show x)
+          codeGen' (Loop a x) = do label <- getLabel
+                                   put (label+2, Indeterm)
+                                   loopContents <- mapM codeGen' x
+                                   putSyscall Indeterm
+                                   let offby = if a == 0 then "" else " + " ++ (show a)
+                                       bLabel = "L" ++ show label
+                                       eLabel = "L" ++ show (label+1)
+                                   return $ do putStrLn $ "\tcmp byte [ecx" ++ offby ++ "], 0\n" ++
+                                                                  "\tje " ++ bLabel ++ "\n" ++
+                                                                  eLabel ++ ":"
+                                               sequence_ loopContents
+                                               putStrLn $ "\tcmp byte [ecx" ++ offby ++ "], 0\n" ++
+                                                          "\tjne " ++ eLabel ++ "\n" ++
+                                                          bLabel ++ ":"
+          codeGen' (Set a x) = return . putStrLn $ "\tmov byte [ecx" ++ offby ++ "], " ++ (show x)
+              where offby = if a == 0 then "" else " + " ++ (show a)
 
 -- Some minor utility functions for the above codeGen' function
 getLabel :: State (Int, a) Int
@@ -206,4 +198,4 @@ putSyscall x = modify $ \(label, syscall) -> (label, x)
 ----
 
 main :: IO ()
-main = getContents >>= putStrLn . comp . opt . parse
+main = getContents >>= comp . opt . parse
