@@ -1,4 +1,4 @@
-import Control.Monad.State
+import Control.Monad.State (modify, gets, put, get, evalState, State)
 
 data BF = Add !Int !Int
         | Move !Int
@@ -39,21 +39,18 @@ parse =
 -- Optimisation
 ----
 opt :: [BF] -> [BF]
-opt = dropWhile f . allPasses . offset 0 0
-    where f (Loop _ _) = True
-          f (Set _ 0) = True
-          f _ = False
+opt = dce . sets . rle . offset . omitInit
 
-allPasses :: [BF] -> [BF]
-allPasses = intoLoops . dce . sets . rle
-
-intoLoops :: [BF] -> [BF]
-intoLoops = map f
-            where f (Loop a x) = Loop a (allPasses x)
-                  f x = x
+-- Omit an initial loop or set instruction
+omitInit :: [BF] -> [BF]
+omitInit = dropWhile (\x -> case x of
+                         Loop _ _ -> True
+                         Set _ 0 -> True
+                         _ -> False)
 
 -- Run-length encode addition and movement operations
 rle :: [BF] -> [BF]
+rle (Loop a x : xs) = Loop a (rle x) : rle xs
 rle (Add a x : Add b y : xs)
     | a == b = rle $ Add a (x + y) : xs
     | otherwise = Add a x : (rle $ Add b y : xs)
@@ -67,6 +64,7 @@ sets :: [BF] -> [BF]
 sets (Loop a [Add b x] : xs) 
     | a == b && (x == (-1) || x == 1)  = sets $ Set a 0 : xs
     | otherwise = Loop a [Add b x] : sets xs
+sets (Loop a x : xs) = Loop a (sets x) : sets xs
 sets (Set a x : Add b y : xs)
     | a == b = sets $ Set a (x+y) : xs
     | otherwise = Set a x : (sets $ Add b y : xs)
@@ -78,13 +76,14 @@ sets [] = []
 dce :: [BF] -> [BF]
 dce (Loop a x : Loop b y : xs) 
     | a == b = dce $ Loop a x : xs
-    | otherwise = Loop a x : (dce $ Loop b y : xs)
+    | otherwise = Loop a (dce x) : (dce $ Loop b y : xs)
 dce (Loop a x : Set b y : xs)
     | a == b && y == 0 = dce $ Loop a x : xs
-    | otherwise = Loop a x : (dce $ Set b y : xs)
+    | otherwise = Loop a (dce x) : (dce $ Set b y : xs)
 dce (Set a x : Loop b y : xs)
     | a == b && x == 0 = dce $ Set a x : xs
     | otherwise = Set a x : (dce $ Loop b y : xs)
+dce (Loop a x : xs) = Loop a (dce x) : dce xs
 dce (Set a x : Set b y : xs)
     | a == b = dce $ Set b y : xs
     | otherwise = Set a x : (dce $ Set b y : xs)
@@ -97,16 +96,18 @@ dce (x : xs) = x : dce xs
 dce [] = []
 
 -- Attempt to reduce the amount of pointer movements done
-offset :: Int -> Int -> [BF] -> [BF]
-offset m n (Loop a y : xs) = Loop (a+m) (offset m (-m) y) : offset m n xs
-offset m n (Move x : xs) = offset (m+x) n xs
-offset m n (Add a x : xs) = Add (a+m) x : offset m n xs
-offset m n (Set a x : xs) = Set (a+m) x : offset m n xs
-offset 0 n (x : xs) = x : offset 0 n xs
-offset m n (x : xs) = Move m : x : offset 0 n xs
-offset m n []
-  | m /= (-n) = [Move (m+n)]
-  | otherwise = []
+offset :: [BF] -> [BF]
+offset = offset' 0 0
+  where offset' :: Int -> Int -> [BF] -> [BF]
+        offset' m n (Loop a y : xs) = Loop (a+m) (offset' m (-m) y) : offset' m n xs
+        offset' m n (Move x : xs) = offset' (m+x) n xs
+        offset' m n (Add a x : xs) = Add (a+m) x : offset' m n xs
+        offset' m n (Set a x : xs) = Set (a+m) x : offset' m n xs
+        offset' 0 n (x : xs) = x : offset' 0 n xs
+        offset' m n (x : xs) = Move m : x : offset' 0 n xs
+        offset' m n []
+          | m /= (-n) = [Move (m+n)]
+          | otherwise = []
 
 ----
 -- Compilation
